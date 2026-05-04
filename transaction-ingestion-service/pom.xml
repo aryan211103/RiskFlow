@@ -8,8 +8,8 @@
 		<version>3.5.13</version>
 		<relativePath/> <!-- lookup parent from repository -->
 	</parent>
-	<groupId>com.contentmoderation</groupId>
-	<artifactId>post-service</artifactId>
+	<groupId>com.riskflow</groupId>
+	<artifactId>transaction-ingestion-service</artifactId>
 	<version>0.0.1-SNAPSHOT</version>
 	<name/>
 	<description/>
