@@ -1,207 +1,121 @@
 # RiskFlow
 
-> An event-driven transaction risk scoring platform built on Java, Spring Boot, Apache Kafka, Redis, and PostgreSQL.
+A distributed backend system that scores financial transactions for fraud risk in real time.
 
-RiskFlow is a distributed microservices backend that ingests transaction events, scores them through a multi-stage asynchronous pipeline, and produces auditable risk decisions with sub-100ms end-to-end latency. The architecture is modeled after production fraud decisioning backends at payment companies — rule-based scoring is the industry norm in fraud (used by Stripe Radar, Visa, and major banks) because it is auditable, explainable, and tunable without retraining a model.
+When a transaction comes in, RiskFlow runs it through a multi-stage pipeline — checking hard rules, analyzing behavioral patterns, and evaluating a configurable rule engine — then stamps it as **APPROVED**, **NEEDS REVIEW**, or **AUTO REJECTED**. Every decision is logged with a full audit trail explaining exactly why it was made.
 
-This is a pure software engineering project. Its purpose is to demonstrate production-grade backend patterns: idempotent Kafka consumers, the transactional outbox, dead-letter classification and replay, a hot-reloadable composable rule engine, and cross-entity behavioral analytics in Redis. An MCP server exposes the entire platform as typed tools drivable by fraud analysts via Claude Desktop or any external client.
+Built with Java, Spring Boot, Apache Kafka, Redis, and PostgreSQL across five microservices.
 
 ---
 
-## Architecture
+## What it does
 
-```
-Transaction event (POST /transactions or synthetic generator)
-        │
-        ▼
-Transaction Ingestion Service (port 8082)
-        │
-        ├── Single DB transaction:
-        │     INSERT transaction (status=PENDING)
-        │     INSERT outbox_events row
-        │     COMMIT
-        │
-        └── Outbox Relay (background poller)
-              Reads unpublished outbox rows
-              Publishes to Kafka → marks published_at
-        │
-        ▼
-Kafka topic: transaction.received
-        │
-        ▼
-Risk Scoring Service (port 8083)
-        │
-        ├── Idempotency check (Redis) ── already scored? skip + commit offset
-        │
-        ├── Stage 1: Hard Rules
-        │     Card on blocklist       → AUTO_REJECTED immediately
-        │     Amount above hard cap   → AUTO_REJECTED immediately
-        │     Sanctioned country      → AUTO_REJECTED immediately
-        │
-        ├── Stage 2: Behavioral Analyzer (Redis sliding windows)
-        │     Per-card velocity:      txn count in last 60s / 5min / 1hr
-        │     Per-device cross-card:  distinct cards from device in last hour
-        │     Per-IP cross-card:      distinct cards from IP in last hour
-        │     Geographic state:       impossible travel detection
-        │     Spend pattern:          rolling mean/stddev deviation per user
-        │
-        ├── Stage 3: Rule Engine (hot-reloadable, composable SpEL expressions)
-        │     Rules loaded from PostgreSQL at startup
-        │     Hot reload via POST /admin/rules/reload
-        │     Each rule evaluates a boolean expression over TransactionContext
-        │     Each rule fire → reason code + score contribution
-        │
-        ├── Stage 4: External Enrichment (circuit-breaker-protected)
-        │     Resilience4j circuit breaker wraps external API call
-        │     On breaker open → graceful degradation, pipeline continues
-        │
-        ├── Decision Engine
-        │     risk_score < 20        → APPROVED
-        │     20 ≤ risk_score < 60   → NEEDS_REVIEW
-        │     risk_score ≥ 60        → AUTO_REJECTED
-        │     Full audit trail stored in PostgreSQL
-        │
-        └── On failure (after retries) → publish to DLQ topic
-                │
-                ▼
-        DLQ Processor Service (port 8084)
-                │
-                ├── Transient failure     → retry with exponential backoff
-                ├── Poison message        → quarantine + alert
-                └── Downstream unavailable → park, replay on health recovery
-```
+1. A transaction event arrives via REST API
+2. It gets saved to the database and published to a Kafka topic
+3. The Risk Scoring Service picks it up asynchronously and runs it through three scoring stages
+4. A decision comes out the other end — with a score, a reason, and a full record of what triggered it
+5. A fraud analyst can review flagged transactions and override decisions through a natural language interface powered by Claude Desktop
+
+---
+
+## The scoring pipeline
+
+**Stage 1 — Hard Rules**
+Instant blocks. Card on a blocklist, amount above a hard cap, transaction from a sanctioned country — these get rejected immediately without going further.
+
+**Stage 2 — Behavioral Analysis**
+Redis tracks activity in real time across three dimensions:
+- Per card: how many transactions in the last 60 seconds, 5 minutes, and 1 hour
+- Per device: how many distinct cards used from this device in the last hour
+- Per IP address: how many distinct cards from this IP in the last hour
+
+This catches coordinated fraud patterns that single-account checks miss — card testing rings, device takeovers, carding operations.
+
+**Stage 3 — Rule Engine**
+Rules are stored in the database and can be updated without redeploying. Each rule is a boolean expression evaluated against the transaction and its behavioral signals. Examples:
+
+- Card testing: small amount, multiple transactions, multiple merchants in 5 minutes
+- Impossible travel: transaction from a country 1000km away, less than 30 minutes after the last one
+- Device takeover: five or more distinct cards from the same device in an hour
+
+**Decision**
+Scores below 20 are approved. Scores between 20 and 59 go to a review queue. Scores of 60 and above are auto rejected.
+
+---
+
+## What makes it interesting
+
+**The outbox pattern**
+Most systems do two separate writes when a transaction comes in — save to the database, then publish to Kafka. If anything fails between those two steps, you get silent data loss. RiskFlow uses the transactional outbox pattern: both writes happen inside a single database transaction, and a background relay handles the Kafka publish. No transaction is ever lost.
+
+**Idempotent consumers**
+Kafka guarantees at-least-once delivery, which means the same message can arrive twice under failure conditions. Before processing any message, the Risk Scoring Service checks Redis to see if this transaction has already been scored. If yes, it skips — no duplicate decisions, no corrupt audit trail.
+
+**Dead letter queue with active handling**
+When message processing fails, the message goes to a dead letter topic. A dedicated DLQ Processor Service reads that topic, classifies each failure (transient error, bad message, downstream service down), and takes the right action — retry, quarantine, or park and replay when the downstream service recovers. This is not just a graveyard topic.
+
+**Analyst interface via MCP**
+An MCP server exposes the platform as tools that can be called by Claude Desktop. A fraud analyst can have a conversation like:
+
+> "Show me the five most borderline transactions from the last hour"
+
+> "Why was transaction txn_8f2a4c rejected?"
+
+> "Override txn_3b1d to approved — user appealed and the context is clean"
+
+Every override is stored in the audit log. The tools are plain HTTP under the hood — Claude is just one possible client.
 
 ---
 
 ## Services
 
-| Service | Port | Status | Description |
-|---|---|---|---|
-| Auth Service | 8081 | Complete | User registration, login, JWT authentication |
-| Transaction Ingestion Service | 8082 | Complete (outbox in progress) | Accepts transaction events, persists to PostgreSQL, publishes via outbox relay |
-| Risk Scoring Service | 8083 | In progress | Multi-stage scoring pipeline: hard rules, behavioral analytics, rule engine, decision engine |
-| DLQ Processor Service | 8084 | Planned | Failure classification, replay, and quarantine |
-| MCP Server | — | Planned | Typed tools exposing the platform to external clients and LLM agents |
+| Service | Port | Status |
+|---|---|---|
+| Auth Service | 8081 | Complete |
+| Transaction Ingestion Service | 8082 | Complete |
+| Risk Scoring Service | 8083 | In progress |
+| DLQ Processor Service | 8084 | Planned |
+| MCP Server | — | Planned |
 
 ---
 
-## Tech Stack
+## Tech stack
 
-| Layer | Technology |
+| | |
 |---|---|
-| Backend | Java 17, Spring Boot 3 |
+| Language | Java 17 |
+| Framework | Spring Boot 3 |
 | Database | PostgreSQL 16 |
-| Cache and behavioral state | Redis 7 |
-| Messaging | Apache Kafka (Confluent 7.4) |
+| Cache | Redis 7 |
+| Messaging | Apache Kafka |
 | Resilience | Resilience4j |
 | Containers | Docker, Docker Compose |
-| Testing | JUnit 5, Mockito, Testcontainers |
-| External interface | Model Context Protocol (MCP) server |
-| CI/CD | GitHub Actions (planned) |
+| Analyst interface | Model Context Protocol (MCP) |
 
 ---
 
-## Transaction Event Schema
+## Running locally
 
-Every transaction event carries a rich data model enabling cross-entity behavioral tracking:
-
-```json
-{
-  "transactionId": "txn_8f2a4c",
-  "userId": "user_abc123",
-  "cardFingerprint": "fpr_4a7b2",
-  "amount": 4500,
-  "currency": "USD",
-  "merchantId": "mch_amazon_us",
-  "merchantCategoryCode": "5942",
-  "merchantRiskTier": "low",
-  "deviceFingerprint": "dev_xyz",
-  "ipAddress": "203.0.113.45",
-  "ipCountry": "RO",
-  "billingCountry": "US",
-  "userAgent": "Mozilla/5.0...",
-  "createdAt": "2026-05-03T14:22:18Z"
-}
-```
-
----
-
-## Key Engineering Patterns
-
-### Transactional Outbox
-The ingestion service writes the transaction row and the outbox event row inside a single database transaction. A background relay polls unpublished outbox rows and publishes them to Kafka. This eliminates the dual-write problem: no transaction is ever persisted without its corresponding Kafka event, and no Kafka event is ever published for a transaction that was not committed.
-
-### Idempotent Kafka Consumer
-Kafka's at-least-once delivery guarantee means the risk scoring service can receive the same message more than once under failure conditions. Before processing any message, the service checks a Redis key for the transaction ID. If the key exists, the message is skipped and the offset is committed. This prevents duplicate risk decisions from appearing in the audit trail.
-
-### Hot-Reloadable Rule Engine
-Risk rules change constantly. Hardcoded if-statements require a redeployment for every policy change. Rules in RiskFlow are persisted in PostgreSQL and loaded into an in-memory engine at startup. A single admin endpoint triggers a live reload without restarting the service. Rules are expressed as boolean SpEL expressions evaluated against a structured TransactionContext object containing all transaction fields and behavioral signals from Stage 2.
-
-Example rule expressions:
-
-```
-# Card testing pattern
-amount < 5 and behavioral.velocity_card_5min >= 3 and behavioral.distinct_merchants_5min >= 3
-
-# Device takeover signal
-behavioral.device_distinct_cards_1hr >= 5
-
-# Impossible travel
-behavioral.geo_distance_from_last_txn_km > 1000 and behavioral.minutes_since_last_txn < 30
-
-# First-time high-risk country
-user.previous_txns_in_country == 0 and ipCountry in highRiskCountries and amount > 200
-```
-
-### Cross-Entity Behavioral Analytics
-Single-entity velocity tracking (per user) is shallow. RiskFlow tracks velocity across three entity types in Redis using sorted sets with TTL-based expiry:
-
-```
-Per-card:    ZADD vel:card:<fingerprint> <timestamp> <txnId>
-Per-device:  SADD device:<fingerprint>:cards:1hr <cardFingerprint>
-Per-IP:      SADD ip:<address>:cards:1hr <cardFingerprint>
-```
-
-This catches coordinated fraud patterns that single-entity tracking misses: card testing rings (many small transactions across merchants from one card), account takeover (many distinct cards from one device), and carding rings (many distinct cards from one IP).
-
-### Dedicated DLQ Processor
-A dead-letter topic with no active consumer is a graveyard. The DLQ Processor Service actively consumes the failure topic, classifies each failure, and takes the appropriate action. Transient failures are retried with exponential backoff. Poison messages (deserialization failures, validation errors) are quarantined and alerted on. Messages that failed because a downstream service was unavailable are parked and replayed automatically on health recovery.
-
-### MCP Server
-The platform exposes a Model Context Protocol server with typed tools covering the full analyst workflow: scoring hypothetical transactions, reviewing the NEEDS_REVIEW queue, overriding decisions with a full audit log entry, explaining any past decision with a complete breakdown of every rule that fired and every behavioral signal that contributed, and inspecting and replaying DLQ messages. The MCP client is Claude Desktop, but the tools are plain HTTP under the hood and could be wired to any client.
-
----
-
-## Running Locally
-
-**Prerequisites:** Docker Desktop, Java 17, Maven
+You need Docker Desktop and Java 17.
 
 ```bash
-# Clone the repo
-git clone https://github.com/aryan211103/riskflow.git
-cd riskflow
-
-# Start all infrastructure (PostgreSQL, Redis, Kafka, ZooKeeper)
+# Clone and start infrastructure
+git clone https://github.com/aryan211103/RiskFlow.git
+cd RiskFlow
 docker compose up -d
 
-# Start Auth Service
+# Create the database
+docker exec -it riskflow-postgres-1 psql -U postgres -c "CREATE DATABASE riskflow;"
+
+# Start the Auth Service
 cd auth-service && ./mvnw spring-boot:run
 
-# Start Transaction Ingestion Service (separate terminal)
+# Start the Transaction Ingestion Service (new terminal)
 cd transaction-ingestion-service && ./mvnw spring-boot:run
-
-# Start Risk Scoring Service (separate terminal)
-cd risk-scoring-service && ./mvnw spring-boot:run
 ```
 
-**Verify Kafka is receiving events:**
-```bash
-docker exec -it <kafka-container-id> \
-  kafka-console-consumer --bootstrap-server localhost:9092 \
-  --topic transaction.received --from-beginning
-```
+Send a test transaction:
 
-**Create a test transaction:**
 ```bash
 curl -X POST http://localhost:8082/transactions \
   -H "Content-Type: application/json" \
@@ -219,41 +133,12 @@ curl -X POST http://localhost:8082/transactions \
 
 ---
 
-## Project Status
+## Why rule-based and not ML
 
-This project is under active development. The tier system below governs build order: Tier 1 ships as a standalone defensible system before any Tier 2 work begins.
-
-**Tier 1 (in progress)**
-- [x] Auth Service
-- [x] Transaction Ingestion Service (naive Kafka producer)
-- [x] Risk Scoring Service skeleton (Kafka consumer wired, stub analyzer)
-- [ ] Domain refactor: Post to Transaction across codebase
-- [ ] Idempotency and basic DLQ topic publishing
-- [ ] Behavioral Analyzer (Redis sliding windows)
-- [ ] Rule Engine v1 (Postgres-persisted rules, hot reload)
-
-**Tier 2 (planned)**
-- [ ] Transactional Outbox Pattern in Ingestion Service
-- [ ] DLQ Processor Service with failure classification and replay
-- [ ] Synthetic Transaction Generator
-- [ ] Composable SpEL rule expressions
-- [ ] External Enrichment with Resilience4j circuit breaker
-- [ ] MCP Server with analyst tools
-
-**Tier 3 (stretch)**
-- [ ] API Gateway with Redis-backed rate limiting
-- [ ] Testcontainers integration tests
-- [ ] GitHub Actions CI/CD
-- [ ] OpenTelemetry distributed tracing
-
----
-
-## Why Rule-Based Scoring
-
-Rule-based decisioning is not a compromise. It is the production standard in fraud and risk systems at payment companies, banks, and processors. The reasons are regulatory (decisions must be explainable to auditors and customers), operational (rules can be updated in minutes without retraining a model), and practical (obvious fraud patterns are caught cheaply by simple rules; expensive ML inference is reserved for ambiguous cases). RiskFlow's rule engine is designed to reflect this reality: hot-reloadable, composable, auditable, and instrumented per rule.
+Rule-based scoring is the production standard at payment companies, banks, and processors — not a compromise. Rules are explainable to auditors, updateable in minutes without retraining anything, and handle the obvious cases cheaply so expensive inference is reserved for the hard ones. RiskFlow's rule engine is designed to reflect this: hot-reloadable, composable, and fully auditable.
 
 ---
 
 ## Author
 
-Aryan — MSCS student at Northeastern University (Khoury College of Computer Sciences), specializing in AI and ML.
+Aryan — MSCS student at Northeastern University (Khoury College of Computer Sciences)
