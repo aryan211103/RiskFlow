@@ -16,6 +16,7 @@ import com.riskflow.scoring.dto.TransactionEvent;
 import com.riskflow.scoring.model.DecisionType;
 import com.riskflow.scoring.model.RiskDecision;
 import com.riskflow.scoring.repository.RiskDecisionRepository;
+import com.riskflow.scoring.service.BehavioralAnalyzer;
 
 /**
  * Kafka consumer for the transaction.received topic.
@@ -99,12 +100,15 @@ public class TransactionEventConsumer {
      */
     private final RiskDecisionRepository decisionRepository;
     private final StringRedisTemplate redis;
+    private final BehavioralAnalyzer behavioralAnalyzer;
 
     public TransactionEventConsumer(RiskDecisionRepository decisionRepository,
-                                     StringRedisTemplate redis) {
+                                    StringRedisTemplate redis,
+                                    BehavioralAnalyzer behavioralAnalyzer) {
         this.decisionRepository = decisionRepository;
         this.redis = redis;
-    }
+        this.behavioralAnalyzer = behavioralAnalyzer;
+}
 
     // -----------------------------------------------------------------------
     // Kafka listener
@@ -216,18 +220,25 @@ public class TransactionEventConsumer {
             return;
         }
 
+        // Step 4: Stage 2 — Behavioral Analysis
         // -------------------------------------------------------------------
-        // Step 4: No hard rules triggered — APPROVED for now
-        // -------------------------------------------------------------------
-        // In Phase 4c, this is where behavioral velocity analytics will run.
-        // In Phase 5, this is where the rule engine will run.
-        // For Phase 4b, anything that passes hard rules is APPROVED with
-        // a score of 0.
-        log.info("No hard rules triggered. Approving txnId={}", txnId);
-        saveDecision(txnId, DecisionType.APPROVED, 0,
-            "PASSED_HARD_RULES", "HARD_RULES");
-    }
+        // Hard rules passed. Now run velocity and cross-entity checks.
+        // The analyzer returns a score from 0 to ~100 based on Redis signals.
+        int behavioralScore = behavioralAnalyzer.analyze(event);
+        log.info("Behavioral score. txnId={} score={}", txnId, behavioralScore);
 
+        // Decision thresholds
+        DecisionType decision;
+        if (behavioralScore >= 60) {
+            decision = DecisionType.AUTO_REJECTED;
+        } else if (behavioralScore >= 20) {
+            decision = DecisionType.NEEDS_REVIEW;
+        } else {
+            decision = DecisionType.APPROVED;
+        }
+
+        saveDecision(txnId, decision, behavioralScore, "BEHAVIORAL_ANALYSIS", "STAGE_2");
+    }
     // -----------------------------------------------------------------------
     // Private helper
     // -----------------------------------------------------------------------
