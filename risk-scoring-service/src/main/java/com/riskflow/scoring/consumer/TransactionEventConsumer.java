@@ -17,6 +17,7 @@ import com.riskflow.scoring.model.DecisionType;
 import com.riskflow.scoring.model.RiskDecision;
 import com.riskflow.scoring.repository.RiskDecisionRepository;
 import com.riskflow.scoring.service.BehavioralAnalyzer;
+import com.riskflow.scoring.service.RuleEngine;
 
 /**
  * Kafka consumer for the transaction.received topic.
@@ -101,14 +102,17 @@ public class TransactionEventConsumer {
     private final RiskDecisionRepository decisionRepository;
     private final StringRedisTemplate redis;
     private final BehavioralAnalyzer behavioralAnalyzer;
+    private final RuleEngine ruleEngine;
 
     public TransactionEventConsumer(RiskDecisionRepository decisionRepository,
                                     StringRedisTemplate redis,
-                                    BehavioralAnalyzer behavioralAnalyzer) {
+                                    BehavioralAnalyzer behavioralAnalyzer,
+                                    RuleEngine ruleEngine) {
         this.decisionRepository = decisionRepository;
         this.redis = redis;
         this.behavioralAnalyzer = behavioralAnalyzer;
-}
+        this.ruleEngine = ruleEngine;
+    }   
 
     // -----------------------------------------------------------------------
     // Kafka listener
@@ -227,17 +231,25 @@ public class TransactionEventConsumer {
         int behavioralScore = behavioralAnalyzer.analyze(event);
         log.info("Behavioral score. txnId={} score={}", txnId, behavioralScore);
 
-        // Decision thresholds
-        DecisionType decision;
-        if (behavioralScore >= 60) {
-            decision = DecisionType.AUTO_REJECTED;
-        } else if (behavioralScore >= 20) {
-            decision = DecisionType.NEEDS_REVIEW;
+
+        // Stage 3 — Rule Engine
+        // Evaluate all hot-reloadable SpEL rules and accumulate score.
+        int ruleScore = ruleEngine.evaluate(event);
+        int totalScore = behavioralScore + ruleScore;
+        log.info("Total score. txnId={} behavioral={} rules={} total={}",
+            txnId, behavioralScore, ruleScore, totalScore);
+
+        // Final decision using combined score
+        DecisionType finalDecision;
+        if (totalScore >= 60) {
+            finalDecision = DecisionType.AUTO_REJECTED;
+        } else if (totalScore >= 20) {
+            finalDecision = DecisionType.NEEDS_REVIEW;
         } else {
-            decision = DecisionType.APPROVED;
+            finalDecision = DecisionType.APPROVED;
         }
 
-        saveDecision(txnId, decision, behavioralScore, "BEHAVIORAL_ANALYSIS", "STAGE_2");
+        saveDecision(txnId, finalDecision, totalScore, "RULE_ENGINE", "STAGE_3");
     }
     // -----------------------------------------------------------------------
     // Private helper
