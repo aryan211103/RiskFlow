@@ -66,6 +66,35 @@
             <artifactId>spring-kafka-test</artifactId>
             <scope>test</scope>
         </dependency>
+
+        <!--
+            Resilience4j Spring Boot starter — Phase 10.
+
+            Resilience4j is a fault-tolerance library. This starter auto-configures
+            circuit breakers, retries, time limiters, and bulkheads from properties.
+
+            Why spring-boot-starter-aop?
+            Resilience4j's @CircuitBreaker and @Retry annotations work via Spring AOP
+            (Aspect-Oriented Programming). AOP wraps your method in a proxy at runtime
+            that intercepts the call and applies the resilience logic around it.
+            Without AOP on the classpath, the annotations are silently ignored —
+            the circuit breaker never activates. This is a common gotcha.
+        -->
+        <dependency>
+            <groupId>io.github.resilience4j</groupId>
+            <artifactId>resilience4j-spring-boot3</artifactId>
+            <version>2.1.0</version>
+        </dependency>
+
+        <!--
+            AOP support — required for Resilience4j annotations to function.
+            Without this, @CircuitBreaker and @Retry are no-ops.
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-aop</artifactId>
+        </dependency>
+
     </dependencies>
 
     <build>

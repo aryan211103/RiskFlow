@@ -2,6 +2,7 @@ package com.riskflow.scoring.consumer;
 
 import java.time.Duration;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -13,11 +14,13 @@ import org.springframework.messaging.handler.annotation.Header;
 import org.springframework.messaging.handler.annotation.Payload;
 import org.springframework.stereotype.Component;
 
+import com.riskflow.scoring.dto.EnrichmentResult;
 import com.riskflow.scoring.dto.TransactionEvent;
 import com.riskflow.scoring.model.DecisionType;
 import com.riskflow.scoring.model.RiskDecision;
 import com.riskflow.scoring.repository.RiskDecisionRepository;
 import com.riskflow.scoring.service.BehavioralAnalyzer;
+import com.riskflow.scoring.service.ExternalEnrichmentService;
 import com.riskflow.scoring.service.RuleEngine;
 
 @Component
@@ -37,30 +40,29 @@ public class TransactionEventConsumer {
     private static final String IDEMPOTENCY_KEY_PREFIX = "risk:processed:";
     private static final Duration IDEMPOTENCY_TTL = Duration.ofHours(24);
 
-    // The DLQ topic — any unrecoverable failure gets published here.
-    // The DLQ Processor Service listens on this topic.
     private static final String DLQ_TOPIC = "transaction.scoring.failed";
 
     private final RiskDecisionRepository decisionRepository;
     private final StringRedisTemplate redis;
     private final BehavioralAnalyzer behavioralAnalyzer;
     private final RuleEngine ruleEngine;
-
-    // KafkaTemplate is now injected so we can publish to the DLQ topic.
-    // Spring auto-configures this bean using the producer properties
-    // already in application.properties — no extra config needed.
     private final KafkaTemplate<String, String> kafkaTemplate;
+
+    // Phase 10: injected enrichment service — wraps external call with Resilience4j
+    private final ExternalEnrichmentService enrichmentService;
 
     public TransactionEventConsumer(RiskDecisionRepository decisionRepository,
                                     StringRedisTemplate redis,
                                     BehavioralAnalyzer behavioralAnalyzer,
                                     RuleEngine ruleEngine,
-                                    KafkaTemplate<String, String> kafkaTemplate) {
+                                    KafkaTemplate<String, String> kafkaTemplate,
+                                    ExternalEnrichmentService enrichmentService) {
         this.decisionRepository = decisionRepository;
         this.redis = redis;
         this.behavioralAnalyzer = behavioralAnalyzer;
         this.ruleEngine = ruleEngine;
         this.kafkaTemplate = kafkaTemplate;
+        this.enrichmentService = enrichmentService;
     }
 
     @KafkaListener(topics = "transaction.received")
@@ -71,9 +73,6 @@ public class TransactionEventConsumer {
 
         log.debug("Received message from partition={} offset={}", partition, offset);
 
-        // Step 1: Parse the raw payload.
-        // A parse failure is a poison pill — the payload is malformed and
-        // will never succeed. Publish to DLQ immediately and stop.
         TransactionEvent event;
         try {
             event = TransactionEvent.from(raw);
@@ -88,10 +87,6 @@ public class TransactionEventConsumer {
         log.info("Processing transaction txnId={} amount={} ipCountry={} card={}",
             txnId, event.getAmount(), event.getIpCountry(), event.getCardFingerprint());
 
-        // Wrap the entire scoring pipeline in a try-catch.
-        // Any unexpected exception — Redis down, database blip, null pointer —
-        // gets caught here and routed to the DLQ instead of being silently dropped
-        // or blocking the consumer.
         try {
 
             // Step 2: Idempotency check
@@ -103,8 +98,6 @@ public class TransactionEventConsumer {
                 log.info("Duplicate message detected. Already processed txnId={}. Skipping.", txnId);
                 return;
             }
-
-            log.debug("Idempotency claim successful for txnId={}", txnId);
 
             // Step 3: Stage 1 — Hard Rules
             if (BLOCKLISTED_CARDS.contains(event.getCardFingerprint())) {
@@ -137,9 +130,50 @@ public class TransactionEventConsumer {
 
             // Step 5: Stage 3 — Rule Engine
             int ruleScore = ruleEngine.evaluate(event);
-            int totalScore = behavioralScore + ruleScore;
-            log.info("Total score. txnId={} behavioral={} rules={} total={}",
-                txnId, behavioralScore, ruleScore, totalScore);
+
+            // ---------------------------------------------------------------
+            // Step 6: Stage 4 — External Enrichment (Phase 10)
+            //
+            // Call the IP reputation service wrapped in Resilience4j.
+            // The call returns a CompletableFuture because @TimeLimiter
+            // requires async execution.
+            //
+            // .get() blocks the Kafka consumer thread until the future
+            // completes or the fallback fires. This is intentional —
+            // we want the enrichment score before making the final decision.
+            //
+            // If the circuit is OPEN or the call times out, the fallback
+            // returns EnrichmentResult.fallback() with score=0 and the
+            // pipeline continues normally. No exception propagates here.
+            //
+            // The try-catch here is belt-and-suspenders: .get() can throw
+            // InterruptedException or ExecutionException in edge cases.
+            // We treat those as non-fatal and proceed with enrichScore=0.
+            // ---------------------------------------------------------------
+            int enrichScore = 0;
+            try {
+                CompletableFuture<EnrichmentResult> enrichFuture =
+                    enrichmentService.enrich(event.getIpAddress(), txnId);
+
+                EnrichmentResult enrichResult = enrichFuture.get();
+                enrichScore = enrichResult.toScore();
+
+                log.info("[ENRICHMENT] Result. txnId={} reputation={} score={}",
+                    txnId, enrichResult.getReputation(), enrichScore);
+
+            } catch (Exception e) {
+                // This catches InterruptedException and ExecutionException.
+                // The fallback inside ExternalEnrichmentService already handles
+                // circuit open / timeout / retry exhaustion — those never reach here.
+                // This catch is for truly unexpected errors in the Future itself.
+                log.warn("[ENRICHMENT] Unexpected error getting enrichment result. " +
+                    "txnId={} error={}. Proceeding with enrichScore=0.", txnId, e.getMessage());
+            }
+
+            // Combine all four stage scores
+            int totalScore = behavioralScore + ruleScore + enrichScore;
+            log.info("Total score. txnId={} behavioral={} rules={} enrichment={} total={}",
+                txnId, behavioralScore, ruleScore, enrichScore, totalScore);
 
             // Final decision
             DecisionType finalDecision;
@@ -151,20 +185,15 @@ public class TransactionEventConsumer {
                 finalDecision = DecisionType.APPROVED;
             }
 
-            saveDecision(txnId, finalDecision, totalScore, "RULE_ENGINE", "STAGE_3");
+            saveDecision(txnId, finalDecision, totalScore, "RULE_ENGINE", "STAGE_4");
 
         } catch (Exception e) {
-            // Something unexpected failed inside the scoring pipeline.
-            // Publish to the DLQ so the DLQ Processor can classify and retry.
             log.error("Unexpected error scoring txnId={}. Publishing to DLQ. error={}",
                 txnId, e.getMessage());
             publishToDlq(txnId, raw, e.getMessage());
         }
     }
 
-    // Publishes a failed message to the DLQ topic.
-    // The error message is sent as a Kafka header so the DLQ Processor
-    // can read it without needing to parse the payload.
     private void publishToDlq(String transactionId, String payload, String errorMessage) {
         org.apache.kafka.clients.producer.ProducerRecord<String, String> record =
             new org.apache.kafka.clients.producer.ProducerRecord<>(
@@ -172,7 +201,7 @@ public class TransactionEventConsumer {
             );
         record.headers().add("error-message",
             (errorMessage != null ? errorMessage : "Unknown error").getBytes());
-    
+
         kafkaTemplate.send(record);
         log.info("Published to DLQ. txnId={}", transactionId);
     }
