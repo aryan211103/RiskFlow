@@ -1,0 +1,25 @@
+{
+  "name": "riskflow-mcp-server",
+  "version": "1.0.0",
+  "description": "MCP server exposing RiskFlow as typed tools for fraud analyst workflows",
+  "main": "build/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node build/index.js",
+    "dev": "ts-node src/index.ts"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "pg": "^8.13.3",
+    "redis": "^4.7.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.17",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.8.3",
+    "@types/pg": "^8.11.13"
+  }
+}
