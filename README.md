@@ -1,202 +1,246 @@
 # RiskFlow
+
 ![CI](https://github.com/aryan211103/RiskFlow/actions/workflows/ci.yml/badge.svg)
 
-An event-driven transaction risk scoring platform that ingests payment events, scores them through a multi-stage asynchronous pipeline, and produces auditable **APPROVED / NEEDS_REVIEW / AUTO_REJECTED** decisions with sub-second end-to-end latency.
+**Event-driven transaction risk scoring platform built for distributed systems portfolio.**
 
-Built as a pure software and distributed systems showcase — demonstrating event-driven architecture, behavioral analytics, and hot-reloadable decisioning at production quality.
-
----
-
-## What It Does
-
-When a transaction is submitted, RiskFlow runs it through three scoring stages in sequence:
-
-1. **Hard Rules** — instant rejection for blocklisted cards, amounts above a hard cap, or sanctioned countries
-2. **Behavioral Velocity Analytics** — Redis sliding windows detect rapid card usage, and cross-entity tracking catches a single device or IP cycling through multiple cards
-3. **Rule Engine** — composable SpEL boolean expressions loaded from PostgreSQL, hot-reloadable without restarting the service
-
-Every transaction produces a `RiskDecision` record in PostgreSQL with the numeric score, decision, reason, and stage — a complete audit trail.
+RiskFlow ingests payment transactions, scores them through a 4-stage risk pipeline, and produces decisions in real time — all without blocking the caller. No ML, no frontend. Pure backend distributed systems engineering.
 
 ---
 
 ## Architecture
 
 ```
-POST /transactions
-        │
-        ▼
-Transaction Ingestion Service (port 8082)
-        │
-        ├── Persists Transaction to PostgreSQL (status=PENDING)
-        └── Publishes to Kafka topic: transaction.received
-                │
-                ▼
-        Risk Scoring Service (port 8083)
-                │
-                ├── Idempotency check (Redis) — skip if already scored
-                │
-                ├── Stage 1: Hard Rules
-                │     Card on blocklist       → AUTO_REJECTED
-                │     Amount above hard cap   → AUTO_REJECTED
-                │     Sanctioned country      → AUTO_REJECTED
-                │
-                ├── Stage 2: Behavioral Analyzer (Redis sliding windows)
-                │     Per-card velocity:       1m / 5m / 1h windows
-                │     Per-device cross-card:   distinct cards in 24h
-                │     Per-IP cross-card:       distinct cards in 1h
-                │
-                ├── Stage 3: Rule Engine (hot-reloadable SpEL)
-                │     Rules loaded from PostgreSQL
-                │     Reload via POST /admin/rules/reload
-                │
-                └── Decision Engine
-                      score < 20   → APPROVED
-                      score 20-59  → NEEDS_REVIEW
-                      score ≥ 60   → AUTO_REJECTED
+                        ┌─────────────────────────────────────────────────────┐
+                        │                     RiskFlow                        │
+                        │                                                     │
+  REST POST             │  ┌──────────────┐      Kafka Topic                 │
+ /transactions ────────►│  │  Ingestion   │──── transactions ──►┐            │
+                        │  │  Service     │                      │            │
+                        │  │  :8082       │                      ▼            │
+                        │  └──────┬───────┘            ┌──────────────┐      │
+                        │         │                     │    Risk      │      │
+                        │  Outbox │                     │   Scoring    │──► PostgreSQL
+                        │  Event  │                     │   Service    │      │
+                        │         ▼                     │   :8083      │      │
+                        │  PostgreSQL                   └──────┬───────┘      │
+                        │  (outbox_events)                     │              │
+                        │                                      │ DLQ Topic    │
+                        │  Redis ◄────── Rate Limiting         ▼              │
+                        │  Redis ◄────── Velocity Analytics  ┌──────────────┐ │
+                        │  Redis ◄────── Idempotency Cache   │     DLQ      │ │
+                        │                                    │  Processor   │ │
+                        │  Auth Service :8081                │   :8084      │ │
+                        │  JWT-based authentication          └──────────────┘ │
+                        │                                                     │
+                        │  Jaeger :16686  ◄──── OpenTelemetry Tracing        │
+                        └─────────────────────────────────────────────────────┘
 ```
+
+---
+
+## What Makes This Technically Interesting
+
+- **Transactional outbox pattern** — transactions and outbox events are written in a single database transaction, eliminating the dual-write problem. Kafka publish happens separately via outbox polling, guaranteeing no message is ever lost even if Kafka is temporarily down.
+
+- **4-stage scoring pipeline with SpEL hot reload** — rules are stored in PostgreSQL and evaluated using Spring Expression Language. The rule engine reloads every 60 seconds without a service restart, making it possible to deploy new fraud rules with zero downtime.
+
+- **Behavioral velocity analytics** — Redis sorted sets track card, device, and user transaction frequency across sliding time windows. High-velocity patterns (e.g. 10 transactions from the same card in 60 seconds) contribute to the risk score.
+
+- **Distributed tracing across Kafka** — OpenTelemetry trace context is propagated through Kafka message headers, so a single transaction produces a 151-span trace visible in Jaeger from ingestion through scoring.
+
+- **Testcontainers integration tests** — the full pipeline is tested with real PostgreSQL, Kafka, and Redis containers. No mocks, no in-memory fakes. If container wiring or Hibernate mapping breaks, these tests catch it.
+
+- **Redis-backed distributed rate limiting** — the ingestion endpoint enforces per-client request limits using Redis INCR with TTL. Limits are shared across service instances — the production pattern for horizontal scaling.
 
 ---
 
 ## Tech Stack
 
-| Layer | Technology | Purpose |
-|---|---|---|
-| Backend | Java Spring Boot | Microservices, REST APIs |
-| Database | PostgreSQL | Persistent storage, audit trail |
-| Cache + State | Redis | Sliding-window velocity counters, idempotency |
-| Messaging | Apache Kafka | Async event streaming between services |
-| Containers | Docker + Docker Compose | Run full stack locally |
+| Layer | Technology |
+|---|---|
+| Language | Java 17 |
+| Framework | Spring Boot 3.2 |
+| Messaging | Apache Kafka (Confluent 7.4.0) |
+| Cache / Rate Limiting | Redis 7 |
+| Database | PostgreSQL 16 |
+| Resilience | Resilience4j 2.1.0 (circuit breaker) |
+| Tracing | OpenTelemetry Java agent + Jaeger |
+| Testing | JUnit 5, Testcontainers 1.19.3 |
+| CI/CD | GitHub Actions |
+| Containerization | Docker + Docker Compose |
+| MCP Integration | TypeScript MCP server |
 
 ---
 
 ## Services
 
-| Service | Port | Status |
+| Service | Port | Responsibility |
 |---|---|---|
-| Auth Service | 8081 | ✅ Complete |
-| Transaction Ingestion Service | 8082 | ✅ Complete |
-| Risk Scoring Service | 8083 | ✅ Complete |
+| auth-service | 8081 | JWT token issuance and validation |
+| transaction-ingestion-service | 8082 | Accepts transactions via REST, writes to outbox, publishes to Kafka |
+| risk-scoring-service | 8083 | Consumes Kafka events, runs 4-stage scoring pipeline, writes RiskDecision to PostgreSQL |
+| dlq-processor-service | 8084 | Consumes failed events, classifies as TRANSIENT or POISON_PILL, retries or quarantines |
+
+---
+
+## Scoring Pipeline
+
+Each transaction passes through four sequential stages. Scores accumulate. The final score determines the decision.
+
+```
+Stage 1 — Hard Rules
+  Blocklisted card fingerprint       → immediate AUTO_REJECTED
+  Sanctioned country (IP or billing) → immediate AUTO_REJECTED
+  Amount exceeds cap ($50,000)       → immediate AUTO_REJECTED
+
+Stage 2 — Behavioral Velocity (Redis sorted sets)
+  Card velocity:   > 5 txns / 60s   → +30 score
+  Device velocity: > 3 txns / 60s   → +20 score
+  User velocity:   > 8 txns / 5min  → +25 score
+
+Stage 3 — SpEL Rule Engine (hot reload every 60s)
+  Rules stored in PostgreSQL, evaluated via Spring Expression Language
+  Example rule: amount > 10000 && merchantRiskTier == 'HIGH' → +40 score
+  New rules deploy without service restart
+
+Stage 4 — External Enrichment
+  IP reputation check (Resilience4j circuit breaker protects this call)
+  High-risk IP → +20 score
+
+Final Decision
+  score >= 80  → AUTO_REJECTED
+  score 50–79  → NEEDS_REVIEW
+  score < 50   → APPROVED
+```
+
+---
+
+## Load Test Results
+
+Tested locally (MacBook, all services via Docker + Maven) on May 10, 2026.
+
+| Metric | Result |
+|---|---|
+| Peak throughput | 20+ transactions/second |
+| Total sent | 215 transactions in ~30 seconds |
+| Total processed | 215 (zero message loss) |
+| HTTP failures | 0 |
+| Kafka consumer lag | Fully drained within ~60s after burst |
+| Decision breakdown | 262 AUTO_REJECTED, 61 NEEDS_REVIEW, 26 APPROVED |
+
+**Scaling observation:** The ingestion layer is stateless and handled 20+ req/sec with zero failures. The bottleneck is the single Kafka consumer partition. To scale scoring throughput: add partitions and run parallel consumer instances — Kafka's consumer group model handles coordination automatically.
 
 ---
 
 ## Running Locally
 
-**Prerequisites:** Docker, Java 17, Maven
+**Prerequisites:** Docker Desktop, Java 17, Maven
 
-**Step 1 — Start infrastructure:**
 ```bash
-docker compose up -d
+# Start infrastructure (Kafka, PostgreSQL, Redis, Jaeger)
+docker-compose up -d
+
+# Start all four services (from project root)
+./start.sh
 ```
 
-**Step 2 — Start services (each in a separate terminal):**
+Services start on ports 8081–8084. Jaeger UI is available at http://localhost:16686.
+
+**Sending a test transaction:**
+
 ```bash
-cd auth-service && ./mvnw spring-boot:run
-cd transaction-ingestion-service && ./mvnw spring-boot:run
-cd risk-scoring-service && ./mvnw spring-boot:run
-```
-
-**Step 3 — Verify the scoring service loaded rules:**
-
-Look for this line in the risk-scoring-service terminal:
-```
-Rule engine loaded 4 enabled rules
-```
-
----
-
-## Example API Calls
-
-**Register and login:**
-```bash
-curl -X POST http://localhost:8081/auth/register \
+# Get a JWT token first
+TOKEN=$(curl -s -X POST http://localhost:8081/auth/login \
   -H "Content-Type: application/json" \
-  -d '{"username":"analyst1","password":"password123"}'
+  -d '{"username":"admin","password":"password"}' | jq -r .token)
 
-curl -X POST http://localhost:8081/auth/login \
-  -H "Content-Type: application/json" \
-  -d '{"username":"analyst1","password":"password123"}'
-```
-
-**Submit a transaction (triggers NEEDS_REVIEW via rule engine):**
-```bash
+# Submit a transaction
 curl -X POST http://localhost:8082/transactions \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
-    "userId": "user_001",
-    "cardFingerprint": "fpr_abc123",
-    "amount": 600,
+    "userId": "user-001",
+    "cardFingerprint": "card-abc123",
+    "amount": 15000,
     "currency": "USD",
-    "merchantId": "mch_001",
-    "merchantCategoryCode": "5942",
-    "merchantRiskTier": "high",
-    "deviceFingerprint": "dev_001",
-    "ipAddress": "203.0.113.45",
+    "merchantId": "merchant-1",
+    "merchantCategoryCode": "5411",
+    "merchantRiskTier": "HIGH",
+    "deviceFingerprint": "device-xyz",
+    "ipAddress": "1.2.3.4",
     "ipCountry": "US",
-    "billingCountry": "US"
+    "billingCountry": "US",
+    "userAgent": "Mozilla/5.0"
   }'
 ```
 
-**Submit a transaction that hits a hard rule (AUTO_REJECTED):**
+---
+
+## Running Tests
+
+**Unit tests only (no Docker required):**
 ```bash
-curl -X POST http://localhost:8082/transactions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "userId": "user_002",
-    "cardFingerprint": "fpr_BLOCKED_001",
-    "amount": 50,
-    "currency": "USD",
-    "merchantId": "mch_001",
-    "merchantCategoryCode": "5942",
-    "merchantRiskTier": "low",
-    "deviceFingerprint": "dev_002",
-    "ipAddress": "203.0.113.45",
-    "ipCountry": "US",
-    "billingCountry": "US"
-  }'
+# Run from any service directory
+./mvnw test -Dtest="!ScoringPipelineIntegrationTest,!RateLimitIntegrationTest"
 ```
 
-**Hot-reload rules after updating the database:**
+**Integration tests (requires Docker Desktop):**
 ```bash
-curl -X POST http://localhost:8083/admin/rules/reload
+# Scoring pipeline end-to-end (PostgreSQL + Kafka + Redis containers)
+cd risk-scoring-service
+./mvnw test -Dtest=ScoringPipelineIntegrationTest
+
+# Rate limiting (PostgreSQL + Kafka + Redis containers)
+cd transaction-ingestion-service
+./mvnw test -Dtest=RateLimitIntegrationTest
+```
+
+**Note for Testcontainers on Docker Desktop 29.x:**
+```bash
+echo "api.version=1.44" > ~/.docker-java.properties
 ```
 
 ---
 
-## Seeding Rules
+## CI/CD
 
-Connect to PostgreSQL and insert scoring rules:
+GitHub Actions runs 4 parallel jobs on every push:
 
-```bash
-docker exec -it riskflow-postgres-1 psql -U postgres -d riskflow
-```
-
-```sql
-INSERT INTO rules (id, name, expression, score, enabled)
-VALUES (nextval('rule_seq'), 'high_risk_merchant', 'merchantRiskTier == ''high''', 25, true);
-
-INSERT INTO rules (id, name, expression, score, enabled)
-VALUES (nextval('rule_seq'), 'high_amount', 'amount > 500', 20, true);
-
-INSERT INTO rules (id, name, expression, score, enabled)
-VALUES (nextval('rule_seq'), 'gambling_mcc', 'merchantCategoryCode == ''7995''', 30, true);
-
-INSERT INTO rules (id, name, expression, score, enabled)
-VALUES (nextval('rule_seq'), 'country_mismatch', 'ipCountry != billingCountry', 15, true);
-```
-
-Then reload without restarting:
-```bash
-curl -X POST http://localhost:8083/admin/rules/reload
-```
-
----
-
-## Decision Thresholds
-
-| Score Range | Decision |
+| Job | What it tests |
 |---|---|
-| 0 – 19 | APPROVED |
-| 20 – 59 | NEEDS_REVIEW |
-| 60+ | AUTO_REJECTED |
+| Auth Service | Unit tests |
+| Transaction Ingestion Service | Unit tests + RateLimitIntegrationTest |
+| Risk Scoring Service | Unit tests + ScoringPipelineIntegrationTest (5 end-to-end tests) |
+| DLQ Processor Service | Unit tests |
 
-Hard rules always produce score 100 and bypass the pipeline entirely.
+Total CI time: ~45 seconds. The green badge at the top of this README reflects the latest run.
+
+---
+
+## Observability
+
+**Jaeger UI:** http://localhost:16686
+
+RiskFlow uses OpenTelemetry distributed tracing with manual spans for all four scoring stages. Trace context is propagated through Kafka message headers, so each transaction produces a single trace that spans two services and crosses the Kafka boundary.
+
+**What to look for in Jaeger:**
+- Search for service `risk-scoring-service`
+- Open any trace — you will see 151 spans
+- The root span starts in `transaction-ingestion-service` and continues into `risk-scoring-service` via Kafka
+- Each scoring stage (hard rules, velocity, SpEL engine, IP enrichment) has its own span with duration and outcome
+
+---
+
+## MCP Integration
+
+RiskFlow includes a TypeScript MCP server (`riskflow-mcp-server`) that exposes 8 tools to Claude Desktop:
+
+- `get_transaction` — look up a transaction by ID
+- `get_risk_decision` — retrieve the scoring decision for a transaction
+- `list_pending_review` — list all transactions in NEEDS_REVIEW state
+- `override_decision` — manually approve or reject a transaction
+- `get_velocity_stats` — inspect Redis velocity counters for a user/card/device
+- `list_active_rules` — show all active SpEL rules in the rule engine
+- `reload_rules` — trigger immediate rule reload without waiting for the 60s cycle
+- `get_dlq_events` — inspect quarantined POISON_PILL events
