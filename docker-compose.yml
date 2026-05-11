@@ -25,3 +25,11 @@ services:
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+  jaeger:
+    image: jaegertracing/all-in-one:1.57
+    container_name: riskflow-jaeger
+    ports:
+      - "16686:16686"   # Jaeger UI — open this in your browser
+      - "4318:4318"     # OTLP HTTP — where your services send spans
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true

@@ -13,3 +13,4 @@
 # Sensitive
 **/application-prod.yaml
 riskflow-mcp-server/node_modules/
+opentelemetry-javaagent.jar

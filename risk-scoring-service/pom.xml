@@ -95,6 +95,25 @@
             <artifactId>spring-boot-starter-aop</artifactId>
         </dependency>
 
+        <!-- OpenTelemetry API — used to create manual spans for each scoring stage.
+            The API jar is lightweight — it only provides the interfaces.
+            The actual implementation is injected by the Java agent at runtime,
+            so we do NOT need to add the SDK as a dependency. -->
+        <dependency>
+            <groupId>io.opentelemetry</groupId>
+            <artifactId>opentelemetry-api</artifactId>
+        </dependency>
+
+        <!-- OpenTelemetry instrumentation annotations — lets us use @WithSpan
+            to create spans declaratively on methods without writing boilerplate.
+            We use the programmatic API instead for finer control, but this
+            brings in the annotation support just in case. -->
+        <dependency>
+            <groupId>io.opentelemetry.instrumentation</groupId>
+            <artifactId>opentelemetry-instrumentation-annotations</artifactId>
+            <version>2.3.0</version>
+        </dependency>
+
     </dependencies>
 
     <build>

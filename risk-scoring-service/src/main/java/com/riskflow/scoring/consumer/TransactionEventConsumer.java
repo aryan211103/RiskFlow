@@ -23,6 +23,13 @@ import com.riskflow.scoring.service.BehavioralAnalyzer;
 import com.riskflow.scoring.service.ExternalEnrichmentService;
 import com.riskflow.scoring.service.RuleEngine;
 
+import io.opentelemetry.api.GlobalOpenTelemetry;
+import io.opentelemetry.api.trace.Span;
+import io.opentelemetry.api.trace.SpanKind;
+import io.opentelemetry.api.trace.StatusCode;
+import io.opentelemetry.api.trace.Tracer;
+import io.opentelemetry.context.Scope;
+
 @Component
 public class TransactionEventConsumer {
 
@@ -42,13 +49,19 @@ public class TransactionEventConsumer {
 
     private static final String DLQ_TOPIC = "transaction.scoring.failed";
 
+    // The Tracer is our factory for creating Spans.
+    // "riskflow-scoring" is the instrumentation scope name — it appears
+    // in Jaeger to identify which component created each span.
+    // The agent populates GlobalOpenTelemetry at JVM startup, so this
+    // field is safe to initialize here even though it looks static-ish.
+    private final Tracer tracer = GlobalOpenTelemetry
+        .getTracer("riskflow-scoring", "1.0.0");
+
     private final RiskDecisionRepository decisionRepository;
     private final StringRedisTemplate redis;
     private final BehavioralAnalyzer behavioralAnalyzer;
     private final RuleEngine ruleEngine;
     private final KafkaTemplate<String, String> kafkaTemplate;
-
-    // Phase 10: injected enrichment service — wraps external call with Resilience4j
     private final ExternalEnrichmentService enrichmentService;
 
     public TransactionEventConsumer(RiskDecisionRepository decisionRepository,
@@ -87,7 +100,39 @@ public class TransactionEventConsumer {
         log.info("Processing transaction txnId={} amount={} ipCountry={} card={}",
             txnId, event.getAmount(), event.getIpCountry(), event.getCardFingerprint());
 
-        try {
+        // -----------------------------------------------------------------------
+        // ROOT SPAN: score-transaction
+        //
+        // This is the parent span that wraps the entire scoring pipeline.
+        // All four stage spans below are children of this span.
+        //
+        // How the span hierarchy works:
+        //   1. We create the root span here.
+        //   2. We open a Scope — this makes the root span "current" on this thread.
+        //   3. Any span created inside the try block that calls
+        //      tracer.spanBuilder(...).startSpan() automatically becomes a child
+        //      because the builder reads the current span from thread context.
+        //   4. We close the Scope in the finally block.
+        //   5. We end the root span in the finally block.
+        //
+        // Why separate span.end() from scope.close()?
+        // Scope is about thread context — it controls what is "current".
+        // span.end() records the timing and sends the span to Jaeger.
+        // They are different operations and must both happen.
+        // -----------------------------------------------------------------------
+        Span rootSpan = tracer.spanBuilder("score-transaction")
+            .setSpanKind(SpanKind.CONSUMER)
+            // Attributes appear as searchable key-value pairs in Jaeger.
+            // Adding txnId here means you can search "transaction.id = txn_abc123"
+            // in the Jaeger UI and find this exact trace immediately.
+            .setAttribute("transaction.id", txnId)
+            .setAttribute("transaction.amount", event.getAmount())
+            .setAttribute("transaction.ip_country", event.getIpCountry())
+            .startSpan();
+
+        // makeCurrent() puts this span on the thread context.
+        // The returned Scope must be closed — try-with-resources handles that.
+        try (Scope rootScope = rootSpan.makeCurrent()) {
 
             // Step 2: Idempotency check
             String idempotencyKey = IDEMPOTENCY_KEY_PREFIX + txnId;
@@ -96,86 +141,182 @@ public class TransactionEventConsumer {
 
             if (!Boolean.TRUE.equals(claimed)) {
                 log.info("Duplicate message detected. Already processed txnId={}. Skipping.", txnId);
+                // Mark the root span as OK — duplicate detection is expected behavior
+                rootSpan.setAttribute("skipped.reason", "duplicate");
+                rootSpan.setStatus(StatusCode.OK);
                 return;
             }
 
-            // Step 3: Stage 1 — Hard Rules
-            if (BLOCKLISTED_CARDS.contains(event.getCardFingerprint())) {
-                log.warn("HARD_RULE: Blocklisted card. txnId={} card={}",
-                    txnId, event.getCardFingerprint());
-                saveDecision(txnId, DecisionType.AUTO_REJECTED, 100,
-                    "BLOCKLIST_HIT", "HARD_RULES");
-                return;
+            // -------------------------------------------------------------------
+            // STAGE 1 SPAN: hard-rules
+            //
+            // Wraps the three hard rule checks (blocklist, amount cap, countries).
+            // If any hard rule fires, we mark this span with which rule triggered
+            // so it's immediately visible in Jaeger without reading logs.
+            // -------------------------------------------------------------------
+            Span hardRulesSpan = tracer.spanBuilder("stage1-hard-rules")
+                .setSpanKind(SpanKind.INTERNAL)
+                .setAttribute("transaction.id", txnId)
+                .startSpan();
+
+            try (Scope hardRulesScope = hardRulesSpan.makeCurrent()) {
+
+                if (BLOCKLISTED_CARDS.contains(event.getCardFingerprint())) {
+                    log.warn("HARD_RULE: Blocklisted card. txnId={} card={}",
+                        txnId, event.getCardFingerprint());
+                    // Record which rule fired as a span attribute
+                    hardRulesSpan.setAttribute("hard_rule.triggered", "BLOCKLIST_HIT");
+                    hardRulesSpan.setAttribute("hard_rule.card", event.getCardFingerprint());
+                    hardRulesSpan.setStatus(StatusCode.OK);
+                    hardRulesSpan.end();
+                    saveDecision(txnId, DecisionType.AUTO_REJECTED, 100,
+                        "BLOCKLIST_HIT", "HARD_RULES");
+                    rootSpan.setAttribute("decision", "AUTO_REJECTED");
+                    rootSpan.setAttribute("decision.reason", "BLOCKLIST_HIT");
+                    rootSpan.setStatus(StatusCode.OK);
+                    return;
+                }
+
+                if (event.getAmount() > HARD_CAP_AMOUNT) {
+                    log.warn("HARD_RULE: Amount exceeds cap. txnId={} amount={} cap={}",
+                        txnId, event.getAmount(), HARD_CAP_AMOUNT);
+                    hardRulesSpan.setAttribute("hard_rule.triggered", "AMOUNT_EXCEEDS_CAP");
+                    hardRulesSpan.setAttribute("hard_rule.amount", event.getAmount());
+                    hardRulesSpan.setStatus(StatusCode.OK);
+                    hardRulesSpan.end();
+                    saveDecision(txnId, DecisionType.AUTO_REJECTED, 100,
+                        "AMOUNT_EXCEEDS_CAP", "HARD_RULES");
+                    rootSpan.setAttribute("decision", "AUTO_REJECTED");
+                    rootSpan.setAttribute("decision.reason", "AMOUNT_EXCEEDS_CAP");
+                    rootSpan.setStatus(StatusCode.OK);
+                    return;
+                }
+
+                if (SANCTIONED_COUNTRIES.contains(event.getIpCountry())) {
+                    log.warn("HARD_RULE: Sanctioned country. txnId={} ipCountry={}",
+                        txnId, event.getIpCountry());
+                    hardRulesSpan.setAttribute("hard_rule.triggered", "SANCTIONED_COUNTRY");
+                    hardRulesSpan.setAttribute("hard_rule.ip_country", event.getIpCountry());
+                    hardRulesSpan.setStatus(StatusCode.OK);
+                    hardRulesSpan.end();
+                    saveDecision(txnId, DecisionType.AUTO_REJECTED, 100,
+                        "SANCTIONED_COUNTRY", "HARD_RULES");
+                    rootSpan.setAttribute("decision", "AUTO_REJECTED");
+                    rootSpan.setAttribute("decision.reason", "SANCTIONED_COUNTRY");
+                    rootSpan.setStatus(StatusCode.OK);
+                    return;
+                }
+
+                // No hard rule triggered — mark span OK and record that
+                hardRulesSpan.setAttribute("hard_rule.triggered", "NONE");
+                hardRulesSpan.setStatus(StatusCode.OK);
+
+            } finally {
+                // Always end the span, even if an exception occurred inside.
+                // A span that is never ended leaks memory and never appears in Jaeger.
+                hardRulesSpan.end();
             }
 
-            if (event.getAmount() > HARD_CAP_AMOUNT) {
-                log.warn("HARD_RULE: Amount exceeds cap. txnId={} amount={} cap={}",
-                    txnId, event.getAmount(), HARD_CAP_AMOUNT);
-                saveDecision(txnId, DecisionType.AUTO_REJECTED, 100,
-                    "AMOUNT_EXCEEDS_CAP", "HARD_RULES");
-                return;
+            // -------------------------------------------------------------------
+            // STAGE 2 SPAN: behavioral-analyzer
+            //
+            // Wraps the Redis sliding-window velocity checks.
+            // We record the score contribution so you can see in Jaeger
+            // exactly how much behavioral signals added to the total.
+            // -------------------------------------------------------------------
+            int behavioralScore;
+            Span behavioralSpan = tracer.spanBuilder("stage2-behavioral-analyzer")
+                .setSpanKind(SpanKind.INTERNAL)
+                .setAttribute("transaction.id", txnId)
+                .startSpan();
+
+            try (Scope behavioralScope = behavioralSpan.makeCurrent()) {
+                behavioralScore = behavioralAnalyzer.analyze(event);
+                log.info("Behavioral score. txnId={} score={}", txnId, behavioralScore);
+                // Record the score contribution as a span attribute
+                behavioralSpan.setAttribute("behavioral.score", behavioralScore);
+                behavioralSpan.setAttribute("behavioral.card_fingerprint", event.getCardFingerprint());
+                behavioralSpan.setAttribute("behavioral.device_fingerprint", event.getDeviceFingerprint());
+                behavioralSpan.setAttribute("behavioral.ip_address", event.getIpAddress());
+                behavioralSpan.setStatus(StatusCode.OK);
+            } finally {
+                behavioralSpan.end();
             }
 
-            if (SANCTIONED_COUNTRIES.contains(event.getIpCountry())) {
-                log.warn("HARD_RULE: Sanctioned country. txnId={} ipCountry={}",
-                    txnId, event.getIpCountry());
-                saveDecision(txnId, DecisionType.AUTO_REJECTED, 100,
-                    "SANCTIONED_COUNTRY", "HARD_RULES");
-                return;
+            // -------------------------------------------------------------------
+            // STAGE 3 SPAN: rule-engine
+            //
+            // Wraps SpEL expression evaluation against all loaded rules.
+            // We record how many rules were evaluated and the score contributed.
+            // -------------------------------------------------------------------
+            int ruleScore;
+            Span ruleEngineSpan = tracer.spanBuilder("stage3-rule-engine")
+                .setSpanKind(SpanKind.INTERNAL)
+                .setAttribute("transaction.id", txnId)
+                .startSpan();
+
+            try (Scope ruleEngineScope = ruleEngineSpan.makeCurrent()) {
+                ruleScore = ruleEngine.evaluate(event);
+                log.info("Rule engine score. txnId={} score={}", txnId, ruleScore);
+                ruleEngineSpan.setAttribute("rule_engine.score", ruleScore);
+                ruleEngineSpan.setAttribute("rule_engine.mcc", event.getMerchantCategoryCode());
+                ruleEngineSpan.setAttribute("rule_engine.merchant_risk_tier", event.getMerchantRiskTier());
+                ruleEngineSpan.setStatus(StatusCode.OK);
+            } finally {
+                ruleEngineSpan.end();
             }
 
-            // Step 4: Stage 2 — Behavioral Analysis
-            int behavioralScore = behavioralAnalyzer.analyze(event);
-            log.info("Behavioral score. txnId={} score={}", txnId, behavioralScore);
-
-            // Step 5: Stage 3 — Rule Engine
-            int ruleScore = ruleEngine.evaluate(event);
-
-            // ---------------------------------------------------------------
-            // Step 6: Stage 4 — External Enrichment (Phase 10)
+            // -------------------------------------------------------------------
+            // STAGE 4 SPAN: external-enrichment
             //
-            // Call the IP reputation service wrapped in Resilience4j.
-            // The call returns a CompletableFuture because @TimeLimiter
-            // requires async execution.
-            //
-            // .get() blocks the Kafka consumer thread until the future
-            // completes or the fallback fires. This is intentional —
-            // we want the enrichment score before making the final decision.
-            //
-            // If the circuit is OPEN or the call times out, the fallback
-            // returns EnrichmentResult.fallback() with score=0 and the
-            // pipeline continues normally. No exception propagates here.
-            //
-            // The try-catch here is belt-and-suspenders: .get() can throw
-            // InterruptedException or ExecutionException in edge cases.
-            // We treat those as non-fatal and proceed with enrichScore=0.
-            // ---------------------------------------------------------------
+            // Wraps the IP reputation call wrapped in Resilience4j.
+            // This is the most valuable span to watch — if enrichment is slow,
+            // its bar in Jaeger will be visibly wider than everything else.
+            // We record the IP reputation result and score contribution.
+            // -------------------------------------------------------------------
             int enrichScore = 0;
-            try {
-                CompletableFuture<EnrichmentResult> enrichFuture =
-                    enrichmentService.enrich(event.getIpAddress(), txnId);
+            Span enrichSpan = tracer.spanBuilder("stage4-external-enrichment")
+                .setSpanKind(SpanKind.INTERNAL)
+                .setAttribute("transaction.id", txnId)
+                .setAttribute("enrichment.ip_address", event.getIpAddress())
+                .startSpan();
 
-                EnrichmentResult enrichResult = enrichFuture.get();
-                enrichScore = enrichResult.toScore();
+            try (Scope enrichScope = enrichSpan.makeCurrent()) {
+                try {
+                    CompletableFuture<EnrichmentResult> enrichFuture =
+                        enrichmentService.enrich(event.getIpAddress(), txnId);
 
-                log.info("[ENRICHMENT] Result. txnId={} reputation={} score={}",
-                    txnId, enrichResult.getReputation(), enrichScore);
+                    EnrichmentResult enrichResult = enrichFuture.get();
+                    enrichScore = enrichResult.toScore();
 
-            } catch (Exception e) {
-                // This catches InterruptedException and ExecutionException.
-                // The fallback inside ExternalEnrichmentService already handles
-                // circuit open / timeout / retry exhaustion — those never reach here.
-                // This catch is for truly unexpected errors in the Future itself.
-                log.warn("[ENRICHMENT] Unexpected error getting enrichment result. " +
-                    "txnId={} error={}. Proceeding with enrichScore=0.", txnId, e.getMessage());
+                    log.info("[ENRICHMENT] Result. txnId={} reputation={} score={}",
+                        txnId, enrichResult.getReputation(), enrichScore);
+
+                    // Record the reputation result as a searchable attribute
+                    enrichSpan.setAttribute("enrichment.reputation",
+                        enrichResult.getReputation().toString());
+                    enrichSpan.setAttribute("enrichment.score", enrichScore);
+                    enrichSpan.setStatus(StatusCode.OK);
+
+                } catch (Exception e) {
+                    log.warn("[ENRICHMENT] Unexpected error. txnId={} error={}. " +
+                        "Proceeding with enrichScore=0.", txnId, e.getMessage());
+                    // Mark this span as an error so it shows red in Jaeger,
+                    // but the pipeline continues — enrichment failure is non-fatal.
+                    enrichSpan.setStatus(StatusCode.ERROR, e.getMessage());
+                    enrichSpan.recordException(e);
+                }
+            } finally {
+                enrichSpan.end();
             }
 
-            // Combine all four stage scores
+            // -------------------------------------------------------------------
+            // DECISION: combine all four stage scores and decide
+            // -------------------------------------------------------------------
             int totalScore = behavioralScore + ruleScore + enrichScore;
             log.info("Total score. txnId={} behavioral={} rules={} enrichment={} total={}",
                 txnId, behavioralScore, ruleScore, enrichScore, totalScore);
 
-            // Final decision
             DecisionType finalDecision;
             if (totalScore >= 60) {
                 finalDecision = DecisionType.AUTO_REJECTED;
@@ -185,12 +326,29 @@ public class TransactionEventConsumer {
                 finalDecision = DecisionType.APPROVED;
             }
 
+            // Record the final decision and all stage scores on the root span.
+            // This means when you open any trace in Jaeger, the top-level span
+            // immediately shows you the outcome without clicking into children.
+            rootSpan.setAttribute("decision", finalDecision.toString());
+            rootSpan.setAttribute("score.behavioral", behavioralScore);
+            rootSpan.setAttribute("score.rules", ruleScore);
+            rootSpan.setAttribute("score.enrichment", enrichScore);
+            rootSpan.setAttribute("score.total", totalScore);
+            rootSpan.setStatus(StatusCode.OK);
+
             saveDecision(txnId, finalDecision, totalScore, "RULE_ENGINE", "STAGE_4");
 
         } catch (Exception e) {
             log.error("Unexpected error scoring txnId={}. Publishing to DLQ. error={}",
                 txnId, e.getMessage());
+            // Mark the root span as ERROR — this transaction will appear red in Jaeger
+            rootSpan.setStatus(StatusCode.ERROR, e.getMessage());
+            rootSpan.recordException(e);
             publishToDlq(txnId, raw, e.getMessage());
+        } finally {
+            // Always end the root span. If we return early (hard rules, duplicate),
+            // the finally block still runs and the span is properly closed.
+            rootSpan.end();
         }
     }
 
