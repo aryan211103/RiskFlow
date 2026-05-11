@@ -12,19 +12,16 @@ function registerGetRiskDecision(server) {
     }, async ({ transaction_id }) => {
         try {
             const result = await db_js_1.default.query(`SELECT
-            id,
-            transaction_id,
-            decision,
-            total_score,
-            hard_rule_triggered,
-            behavioral_score,
-            rule_engine_score,
-            enrichment_score,
-            created_at
-          FROM risk_decisions
-          WHERE transaction_id = $1
-          ORDER BY created_at DESC
-          LIMIT 1`, [transaction_id]);
+              transaction_id,
+              decision,
+              risk_score,
+              decision_reason,
+              processing_stage,
+              decided_at
+            FROM risk_decisions
+            WHERE transaction_id = $1
+            ORDER BY decided_at DESC
+            LIMIT 1`, [transaction_id]);
             if (result.rows.length === 0) {
                 return {
                     content: [{ type: "text", text: `No risk decision found for transaction: ${transaction_id}` }],
@@ -32,21 +29,17 @@ function registerGetRiskDecision(server) {
             }
             const d = result.rows[0];
             return {
-                content: [
-                    {
+                content: [{
                         type: "text",
                         text: [
                             `Transaction ID: ${d.transaction_id}`,
                             `Decision: ${d.decision}`,
-                            `Total Score: ${d.total_score}`,
-                            `Hard Rule Triggered: ${d.hard_rule_triggered ?? "none"}`,
-                            `Behavioral Score: ${d.behavioral_score}`,
-                            `Rule Engine Score: ${d.rule_engine_score}`,
-                            `Enrichment Score: ${d.enrichment_score}`,
-                            `Decided At: ${d.created_at}`,
+                            `Risk Score: ${d.risk_score}`,
+                            `Reason: ${d.decision_reason}`,
+                            `Processing Stage: ${d.processing_stage}`,
+                            `Decided At: ${d.decided_at}`,
                         ].join("\n"),
-                    },
-                ],
+                    }],
             };
         }
         catch (err) {

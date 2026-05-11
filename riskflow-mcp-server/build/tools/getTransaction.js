@@ -43,7 +43,7 @@ function registerGetTransaction(server) {
             status,
             created_at
           FROM transactions
-          WHERE id = $1`, [transaction_id]);
+          WHERE transaction_id = $1`, [transaction_id]);
             // No rows means the transaction ID doesn't exist
             if (result.rows.length === 0) {
                 return {

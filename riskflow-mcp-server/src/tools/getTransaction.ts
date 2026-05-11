@@ -43,7 +43,7 @@ export function registerGetTransaction(server: McpServer): void {
             status,
             created_at
           FROM transactions
-          WHERE id = $1`,
+          WHERE transaction_id = $1`,
           [transaction_id]
         );
 

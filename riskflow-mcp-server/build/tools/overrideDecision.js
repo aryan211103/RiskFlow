@@ -15,7 +15,7 @@ function registerOverrideDecision(server) {
     }, async ({ transaction_id, new_decision, reason, analyst_id }) => {
         try {
             // First check the decision exists
-            const check = await db_js_1.default.query(`SELECT id, decision FROM risk_decisions WHERE transaction_id = $1 ORDER BY created_at DESC LIMIT 1`, [transaction_id]);
+            const check = await db_js_1.default.query(`SELECT id, decision FROM risk_decisions WHERE transaction_id = $1 ORDER BY decided_at DESC LIMIT 1`, [transaction_id]);
             if (check.rows.length === 0) {
                 return {
                     content: [{ type: "text", text: `No risk decision found for transaction: ${transaction_id}` }],

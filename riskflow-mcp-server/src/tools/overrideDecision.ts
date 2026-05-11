@@ -16,7 +16,7 @@ export function registerOverrideDecision(server: McpServer): void {
       try {
         // First check the decision exists
         const check = await pool.query(
-          `SELECT id, decision FROM risk_decisions WHERE transaction_id = $1 ORDER BY created_at DESC LIMIT 1`,
+          `SELECT id, decision FROM risk_decisions WHERE transaction_id = $1 ORDER BY decided_at DESC LIMIT 1`,
           [transaction_id]
         );
 
