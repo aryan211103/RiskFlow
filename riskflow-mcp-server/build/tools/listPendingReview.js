@@ -14,17 +14,17 @@ function registerListPendingReview(server) {
             const maxRows = limit ?? 20;
             const result = await db_js_1.default.query(`SELECT
             rd.transaction_id,
-            rd.total_score,
-            rd.created_at,
+            rd.risk_score,
+            rd.decided_at,
             t.amount,
             t.currency,
             t.merchant_id,
             t.ip_country,
             t.billing_country
           FROM risk_decisions rd
-          JOIN transactions t ON t.id = rd.transaction_id
+          JOIN transactions t ON t.transaction_id = rd.transaction_id
           WHERE rd.decision = 'NEEDS_REVIEW'
-          ORDER BY rd.created_at DESC
+          ORDER BY rd.decided_at DESC
           LIMIT $1`, [maxRows]);
             if (result.rows.length === 0) {
                 return {
@@ -33,9 +33,9 @@ function registerListPendingReview(server) {
             }
             const lines = result.rows.map((r, i) => [
                 `${i + 1}. Transaction: ${r.transaction_id}`,
-                `   Score: ${r.total_score} | Amount: ${r.amount} ${r.currency}`,
+                `   Score: ${r.risk_score} | Amount: ${r.amount} ${r.currency}`,
                 `   Merchant: ${r.merchant_id} | IP Country: ${r.ip_country} | Billing Country: ${r.billing_country}`,
-                `   Flagged At: ${r.created_at}`,
+                `   Flagged At: ${r.decided_at}`,
             ].join("\n"));
             return {
                 content: [

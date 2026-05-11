@@ -16,17 +16,17 @@ export function registerListPendingReview(server: McpServer): void {
         const result = await pool.query(
           `SELECT
             rd.transaction_id,
-            rd.total_score,
-            rd.created_at,
+            rd.risk_score,
+            rd.decided_at,
             t.amount,
             t.currency,
             t.merchant_id,
             t.ip_country,
             t.billing_country
           FROM risk_decisions rd
-          JOIN transactions t ON t.id = rd.transaction_id
+          JOIN transactions t ON t.transaction_id = rd.transaction_id
           WHERE rd.decision = 'NEEDS_REVIEW'
-          ORDER BY rd.created_at DESC
+          ORDER BY rd.decided_at DESC
           LIMIT $1`,
           [maxRows]
         );
@@ -38,13 +38,13 @@ export function registerListPendingReview(server: McpServer): void {
         }
 
         const lines = result.rows.map((r, i) =>
-          [
-            `${i + 1}. Transaction: ${r.transaction_id}`,
-            `   Score: ${r.total_score} | Amount: ${r.amount} ${r.currency}`,
-            `   Merchant: ${r.merchant_id} | IP Country: ${r.ip_country} | Billing Country: ${r.billing_country}`,
-            `   Flagged At: ${r.created_at}`,
-          ].join("\n")
-        );
+            [
+              `${i + 1}. Transaction: ${r.transaction_id}`,
+              `   Score: ${r.risk_score} | Amount: ${r.amount} ${r.currency}`,
+              `   Merchant: ${r.merchant_id} | IP Country: ${r.ip_country} | Billing Country: ${r.billing_country}`,
+              `   Flagged At: ${r.decided_at}`,
+            ].join("\n")
+          );
 
         return {
           content: [
