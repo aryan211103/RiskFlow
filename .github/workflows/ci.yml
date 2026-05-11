@@ -1,0 +1,126 @@
+# ── RiskFlow CI Pipeline ──────────────────────────────────────────────────────
+#
+# Runs on every push to main and every pull request targeting main.
+# Builds and tests all four Java services in parallel.
+# No infrastructure needed — all tests are pure unit tests with no
+# database, Kafka, or Redis dependencies.
+#
+# What "parallel" means here:
+# GitHub Actions runs each entry under "jobs" independently on its own
+# virtual machine at the same time. All four services build simultaneously
+# instead of one after another. Total CI time = slowest single service,
+# not the sum of all four.
+
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+
+  # ── Auth Service ─────────────────────────────────────────────────────────────
+  auth-service:
+    name: Auth Service
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Cache Maven dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-auth-${{ hashFiles('auth-service/pom.xml') }}
+          restore-keys: ${{ runner.os }}-maven-auth-
+
+      - name: Build and test
+        working-directory: auth-service
+        run: ./mvnw test
+
+  # ── Transaction Ingestion Service ─────────────────────────────────────────────
+  transaction-ingestion-service:
+    name: Transaction Ingestion Service
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Cache Maven dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-ingestion-${{ hashFiles('transaction-ingestion-service/pom.xml') }}
+          restore-keys: ${{ runner.os }}-maven-ingestion-
+
+      - name: Build and test
+        working-directory: transaction-ingestion-service
+        run: ./mvnw test
+
+  # ── Risk Scoring Service ──────────────────────────────────────────────────────
+  risk-scoring-service:
+    name: Risk Scoring Service
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Cache Maven dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-scoring-${{ hashFiles('risk-scoring-service/pom.xml') }}
+          restore-keys: ${{ runner.os }}-maven-scoring-
+
+      - name: Build and test
+        working-directory: risk-scoring-service
+        run: ./mvnw test
+
+  # ── DLQ Processor Service ─────────────────────────────────────────────────────
+  dlq-processor-service:
+    name: DLQ Processor Service
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Cache Maven dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-dlq-${{ hashFiles('dlq-processor-service/pom.xml') }}
+          restore-keys: ${{ runner.os }}-maven-dlq-
+
+      - name: Build and test
+        working-directory: dlq-processor-service
+        run: ./mvnw test
