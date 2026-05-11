@@ -1,4 +1,5 @@
 # RiskFlow
+![CI](https://github.com/aryan211103/RiskFlow/actions/workflows/ci.yml/badge.svg)
 
 An event-driven transaction risk scoring platform that ingests payment events, scores them through a multi-stage asynchronous pipeline, and produces auditable **APPROVED / NEEDS_REVIEW / AUTO_REJECTED** decisions with sub-second end-to-end latency.
 
