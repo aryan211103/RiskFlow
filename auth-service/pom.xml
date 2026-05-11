@@ -80,6 +80,12 @@
     		<version>0.12.6</version>
     		<scope>runtime</scope>
 		</dependency>
+		<!-- JUnit 5 + Mockito — included via spring-boot-starter-test -->
+		<dependency>
+    		<groupId>org.springframework.boot</groupId>
+    		<artifactId>spring-boot-starter-test</artifactId>
+    		<scope>test</scope>
+		</dependency>
 	</dependencies>
 
 	<build>
