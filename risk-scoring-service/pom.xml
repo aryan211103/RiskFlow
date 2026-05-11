@@ -24,6 +24,9 @@
     </properties>
 
     <dependencies>
+
+        <!-- ── Production dependencies ──────────────────────────────────── -->
+
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-web</artifactId>
@@ -56,62 +59,80 @@
         </dependency>
 
         <dependency>
+            <groupId>io.github.resilience4j</groupId>
+            <artifactId>resilience4j-spring-boot3</artifactId>
+            <version>2.1.0</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-aop</artifactId>
+        </dependency>
+
+        <!-- OpenTelemetry API — no version, managed by Spring Boot 3.2 -->
+        <dependency>
+            <groupId>io.opentelemetry</groupId>
+            <artifactId>opentelemetry-api</artifactId>
+        </dependency>
+
+        <!-- OpenTelemetry annotations — version kept because Spring Boot does not manage it -->
+        <dependency>
+            <groupId>io.opentelemetry.instrumentation</groupId>
+            <artifactId>opentelemetry-instrumentation-annotations</artifactId>
+            <version>2.3.0</version>
+        </dependency>
+
+        <!-- ── Test dependencies ─────────────────────────────────────────── -->
+
+        <!-- Spring Boot test slice — JUnit 5, Mockito, AssertJ -->
+        <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-test</artifactId>
             <scope>test</scope>
         </dependency>
 
+        <!-- Spring Kafka test utilities -->
         <dependency>
             <groupId>org.springframework.kafka</groupId>
             <artifactId>spring-kafka-test</artifactId>
             <scope>test</scope>
         </dependency>
 
-        <!--
-            Resilience4j Spring Boot starter — Phase 10.
-
-            Resilience4j is a fault-tolerance library. This starter auto-configures
-            circuit breakers, retries, time limiters, and bulkheads from properties.
-
-            Why spring-boot-starter-aop?
-            Resilience4j's @CircuitBreaker and @Retry annotations work via Spring AOP
-            (Aspect-Oriented Programming). AOP wraps your method in a proxy at runtime
-            that intercepts the call and applies the resilience logic around it.
-            Without AOP on the classpath, the annotations are silently ignored —
-            the circuit breaker never activates. This is a common gotcha.
-        -->
+        <!-- Testcontainers core — container lifecycle management.
+             Version 1.19.3 is the version managed by Spring Boot 3.2.
+             We use the managed version to avoid conflicts. -->
         <dependency>
-            <groupId>io.github.resilience4j</groupId>
-            <artifactId>resilience4j-spring-boot3</artifactId>
-            <version>2.1.0</version>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>testcontainers</artifactId>
+            <scope>test</scope>
         </dependency>
 
-        <!--
-            AOP support — required for Resilience4j annotations to function.
-            Without this, @CircuitBreaker and @Retry are no-ops.
-        -->
+        <!-- Testcontainers PostgreSQL module -->
         <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-aop</artifactId>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>postgresql</artifactId>
+            <scope>test</scope>
         </dependency>
 
-        <!-- OpenTelemetry API — used to create manual spans for each scoring stage.
-            The API jar is lightweight — it only provides the interfaces.
-            The actual implementation is injected by the Java agent at runtime,
-            so we do NOT need to add the SDK as a dependency. -->
+        <!-- Testcontainers Kafka module -->
         <dependency>
-            <groupId>io.opentelemetry</groupId>
-            <artifactId>opentelemetry-api</artifactId>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>kafka</artifactId>
+            <scope>test</scope>
         </dependency>
 
-        <!-- OpenTelemetry instrumentation annotations — lets us use @WithSpan
-            to create spans declaratively on methods without writing boilerplate.
-            We use the programmatic API instead for finer control, but this
-            brings in the annotation support just in case. -->
+        <!-- Testcontainers JUnit 5 integration — @Testcontainers and @Container -->
         <dependency>
-            <groupId>io.opentelemetry.instrumentation</groupId>
-            <artifactId>opentelemetry-instrumentation-annotations</artifactId>
-            <version>2.3.0</version>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- Required by Testcontainers PostgreSQL module -->
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>jdbc</artifactId>
+            <scope>test</scope>
         </dependency>
 
     </dependencies>
