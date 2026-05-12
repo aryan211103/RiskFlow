@@ -118,18 +118,29 @@ Final Decision
 
 ## Load Test Results
 
-Tested locally (MacBook, all services via Docker + Maven) on May 10, 2026.
+Tested locally (MacBook, all services via Docker + Maven) on May 11, 2026.
+
+**Throughput test (rate limiter disabled):**
 
 | Metric | Result |
 |---|---|
-| Peak throughput | 20+ transactions/second |
-| Total sent | 215 transactions in ~30 seconds |
-| Total processed | 215 (zero message loss) |
+| Sustained throughput | 36 transactions/second |
+| Total sent | 2,175 transactions in ~60 seconds |
 | HTTP failures | 0 |
+| Message loss | 0 |
 | Kafka consumer lag | Fully drained within ~60s after burst |
-| Decision breakdown | 262 AUTO_REJECTED, 61 NEEDS_REVIEW, 26 APPROVED |
+| Decision breakdown | AUTO_REJECTED majority, NEEDS_REVIEW on rule matches |
 
-**Scaling observation:** The ingestion layer is stateless and handled 20+ req/sec with zero failures. The bottleneck is the single Kafka consumer partition. To scale scoring throughput: add partitions and run parallel consumer instances — Kafka's consumer group model handles coordination automatically.
+**Rate limiting test (100 requests / 60s window):**
+
+| Metric | Result |
+|---|---|
+| Requests attempted | 1,225 in ~30 seconds |
+| Passed rate limiter | ~100 (first window exhausted in seconds at full speed) |
+| Rate limited (429) | ~1,125 — all correctly rejected with Retry-After header |
+| Message loss on passed requests | 0 |
+
+**Scaling observation:** The ingestion layer is stateless and handled 36 req/sec with zero failures. The bottleneck is the single Kafka consumer partition — one partition means one consumer thread. To scale scoring throughput: add Kafka partitions and run parallel consumer instances. Kafka's consumer group model handles coordination automatically with no code changes required.
 
 ---
 
